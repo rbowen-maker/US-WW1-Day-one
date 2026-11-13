@@ -21,12 +21,78 @@ function local(){try{return JSON.parse(localStorage.getItem(key())||'null');}cat
 $('begin').onclick=async()=>{const a=$('alias').value.trim().toUpperCase();if(!/^[A-Z0-9_-]{3,24}$/.test(a)){status('Use 3–24 letters, numbers, underscores or hyphens; no identifying information.',true);return;}alias=a;$('begin').disabled=true;status('Checking cloud for previous work…');const saved=local();try{const cloud=await jsonp('load',{alias});if(!cloud.ok||cloud.contractVersion!==CONTRACT||cloud.lessonId!==LESSON)throw Error('Backend mismatch');revision=cloud.revision||0;if(saved&&saved.dirty&&cloud.found&&JSON.stringify(saved.responses)!==JSON.stringify(cloud.snapshot.responses)){conflict=true;responses=saved.responses;revision=saved.revision||0;enable();status('CONFLICT: Device and cloud versions differ. Both preserved. Export Emergency PDF; do not save until resolved.',true);$('save').disabled=true;return;}if(saved&&saved.dirty&&!cloud.found){responses=saved.responses;revision=0;dirty=true;}else if(cloud.found){responses=cloud.snapshot.responses;dirty=false;}else if(saved){responses=saved.responses;revision=saved.revision||0;dirty=!!saved.dirty;}enable();status(dirty?'Saved on this device; cloud confirmation pending':'Cloud restore checked. Ready.');if(dirty)queue();}catch(e){offline=true;responses=saved?.responses||empty();revision=saved?.revision||0;dirty=!!saved?.dirty;enable();status('Cloud unavailable. Offline path: responses stay on this device; use Emergency PDF for backup.',true);}};
 function queue(){clearTimeout(timer);timer=setTimeout(save,1100);}
 document.querySelectorAll('textarea,select').forEach(el=>el.addEventListener('input',()=>{if(!active)return;readUI();dirty=true;store();progress();status('Saved on this device — cloud verification pending');if(!conflict)queue();}));
-function save(){if(!active||!dirty||inFlight||conflict)return;inFlight=true;status('Saving to cloud…');const data=snapshot(),raw=JSON.stringify(data),requestId='req_'+Date.now()+'_'+Math.random().toString(36).slice(2),base=revision;
-const frame=document.createElement('iframe');frame.name='save_'+requestId;frame.hidden=true;document.body.append(frame);const form=document.createElement('form');form.method='POST';form.action=ENDPOINT;form.target=frame.name;form.hidden=true;
-const params={action:'save',lessonId:LESSON,alias,requestId,baseRevision:base,snapshot:raw,clientOrigin:location.origin};for(const [k,v] of Object.entries(params)){const input=document.createElement('input');input.name=k;input.value=v;form.append(input);}document.body.append(form);
-let settled=false;const timeout=setTimeout(()=>finish(null),15000);
-function finish(msg){if(settled)return;settled=true;clearTimeout(timeout);window.removeEventListener('message',listener);form.remove();frame.remove();inFlight=false;if(!msg){status('Cloud unavailable — saved on this device; retry with Save now',true);return;}const r=msg.payload;if(r.error==='CONFLICT'){conflict=true;status('CONFLICT: Cloud has a different revision. Device copy preserved. Export Emergency PDF.',true);$('save').disabled=true;return;}if(r.ok&&r.verified&&r.requestId===requestId&&r.revision===base+1){revision=r.revision;if(JSON.stringify(snapshot())===raw){dirty=false;try{localStorage.setItem(key(),JSON.stringify({responses,revision,dirty:false,updated:Date.now()}));}catch(e){}status('Cloud verified — exact response snapshot saved.');}else{status('Saved on device; new changes pending');queue();}}else status('Cloud verification failed — device copy retained',true);}
-function listener(e){if(!['https://script.google.com','https://script.googleusercontent.com'].includes(e.origin))return;if(e.source!==frame.contentWindow)return;const m=e.data;if(m?.channel!=='WWI_MAIN_SAVE_ACK'||m.payload?.lessonId!==LESSON||m.payload?.contractVersion!==CONTRACT||m.payload?.requestId!==requestId)return;finish(m);}window.addEventListener('message',listener);try{form.submit();}catch(e){finish(null);}}
+async function verifyCloud(raw,base,requestId){
+  const cloud=await jsonp('load',{alias});
+  if(!cloud.ok||cloud.lessonId!==LESSON||cloud.contractVersion!==CONTRACT)throw Error('Backend mismatch');
+  if(cloud.found&&cloud.snapshot&&JSON.stringify(cloud.snapshot)===raw&&cloud.revision>=base+1){
+    revision=cloud.revision;
+    if(JSON.stringify(snapshot())===raw){
+      dirty=false;
+      try{localStorage.setItem(key(),JSON.stringify({responses,revision,dirty:false,updated:Date.now()}));}catch(e){}
+      status('Cloud verified — exact response snapshot saved.');
+    }else{
+      store();
+      status('Previous changes cloud verified; newer changes pending.');
+      queue();
+    }
+    return true;
+  }
+  if(cloud.revision!==base){
+    conflict=true;
+    $('save').disabled=true;
+    status('CONFLICT: Cloud differs from this device. Device copy preserved; use Emergency PDF.',true);
+    return true;
+  }
+  return false;
+}
+async function save(){
+  if(!active||!dirty||inFlight||conflict)return;
+  inFlight=true;
+  status('Checking cloud before saving…');
+  const raw=JSON.stringify(snapshot()),base=revision;
+  // Check first: a previous POST may have succeeded even though its acknowledgement was lost.
+  try{
+    if(await verifyCloud(raw,base,'')){inFlight=false;return;}
+  }catch(e){
+    inFlight=false;
+    status('Cloud verification unavailable — device copy preserved; try Save now later.',true);
+    return;
+  }
+  status('Saving to cloud…');
+  const requestId='req_'+Date.now()+'_'+Math.random().toString(36).slice(2);
+  const frame=document.createElement('iframe');frame.name='save_'+requestId;frame.hidden=true;document.body.append(frame);
+  const form=document.createElement('form');form.method='POST';form.action=ENDPOINT;form.target=frame.name;form.hidden=true;
+  const params={action:'save',lessonId:LESSON,alias,requestId,baseRevision:base,snapshot:raw,clientOrigin:location.origin};
+  for(const [k,v] of Object.entries(params)){const input=document.createElement('input');input.name=k;input.value=v;form.append(input);}
+  document.body.append(form);
+  let settled=false;
+  const finish=async(msg)=>{
+    if(settled)return;
+    settled=true;
+    clearTimeout(timeout);
+    window.removeEventListener('message',listener);
+    form.remove();frame.remove();
+    try{
+      // Read-after-write is authoritative, even when iframe acknowledgement is missing.
+      if(await verifyCloud(raw,base,requestId))return;
+      if(msg?.payload?.error==='CONFLICT'){
+        conflict=true;$('save').disabled=true;
+        status('CONFLICT: Cloud has a different revision. Device copy preserved.',true);
+      }else status('Cloud not verified — saved on this device. Retry with Save now.',true);
+    }catch(e){status('Cloud verification unavailable — saved on this device. Retry with Save now.',true);}
+    finally{inFlight=false;}
+  };
+  const timeout=setTimeout(()=>finish(null),15000);
+  function listener(e){
+    if(!['https://script.google.com','https://script.googleusercontent.com'].includes(e.origin))return;
+    if(e.source!==frame.contentWindow)return;
+    const m=e.data;
+    if(m?.channel!=='WWI_MAIN_SAVE_ACK'||m.payload?.lessonId!==LESSON||m.payload?.contractVersion!==CONTRACT||m.payload?.requestId!==requestId)return;
+    finish(m);
+  }
+  window.addEventListener('message',listener);
+  try{form.submit();}catch(e){finish(null);}
+}
 $('save').onclick=()=>{if(conflict){status('Conflict: preserve both versions before choosing a recovery path.',true);return;}readUI();store();dirty=true;save();};
 function printable(){const p=progress();let html=`<!doctype html><html><head><meta charset="utf-8"><title>${TITLE}</title><style>body{font:13pt/1.5 Arial;margin:22mm;color:#111}h1{font-size:21pt}h2{font-size:15pt;break-after:avoid}article{break-inside:auto;margin:16px 0;white-space:pre-wrap;overflow-wrap:anywhere}header{border-bottom:2px solid #111;padding-bottom:12px}@page{size:letter;margin:18mm}</style></head><body><header><h1>${TITLE}</h1><p><b>Alias:</b> ${escapeHtml(alias)}</p><p><b>Completion grade: ${p.pct}% (${p.count} of 10 required responses completed)</b></p></header>`;
 const titles=['Do Now','Visual inquiry — original classroom diagram','Militarism','Alliances','Imperialism','Nationalism','Sarajevo trigger','MAIN cause ranking','Claim and defense','Exit ticket'];IDS.forEach((id,i)=>{let v=responses[id];if(Array.isArray(v))v=v.map((x,n)=>(n+1)+'. '+x).join('\n');html+=`<h2>${titles[i]}</h2><article>${escapeHtml(v||'(No response)')}</article>`;});return html+'<p>Source note: original classroom diagram and teacher-created close readings; reference: Imperial War Museums, How the World Went to War in 1914.</p></body></html>';}
